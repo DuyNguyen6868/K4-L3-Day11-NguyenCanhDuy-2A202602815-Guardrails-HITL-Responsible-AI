@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -27,6 +28,26 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+PII_PATTERNS = {
+    # sk-... style API keys
+    "api_key": r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{5,}",
+    # password=..., password: ..., or "password is <value with a digit>"
+    # ("your password is required" is not a leak, so "is" needs a digit in the value)
+    "password": r"(?:password|passwd|pwd|mật\s*khẩu)\s*(?:[:=]\s*\S+|(?:is|là)\s+(?=\S*\d)\S+)",
+    # Internal hostnames such as db.<bank>.internal:5432
+    "internal_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?\b",
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}",
+    # VN mobile (0/+84 + 3|5|7|8|9 + 8 digits) or landline 02x (11 digits).
+    # Public hotlines like "1900 545 467" do not start with 0/+84 → not matched.
+    "phone": r"(?<!\d)(?:\+?84|0)(?:[35789]\d{8}|2\d{9})(?!\d)",
+    # CMND 9 digits / CCCD 12 digits
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+    # Last: known protected values (canaries from data/protected) — catches a
+    # bare "admin123" that no generic pattern above would flag.
+    "known_secret": "|".join(re.escape(s) for s in DEMO_SECRETS) or r"(?!x)x",
+}
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -39,18 +60,11 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
+    # Order matters: phone (10/11 digits) runs before national ID (9/12 digits),
+    # and each pattern scans the already-redacted text, so nothing is counted twice.
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        # Match on the partly-redacted text so earlier replacements are not re-counted.
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -140,6 +154,12 @@ async def llm_safety_check(response_text: str) -> dict:
 #   - Return the (possibly modified) llm_response, or None to keep original
 # ============================================================
 
+OUTPUT_BLOCK_MESSAGE = (
+    "I cannot share that information. "
+    "How else can I help with your VinBank banking needs?"
+)
+
+
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
 
@@ -172,16 +192,25 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            safe_text = filtered["redacted"].strip() or OUTPUT_BLOCK_MESSAGE
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=safe_text)]
+            )
+            response_text = safe_text
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=OUTPUT_BLOCK_MESSAGE)],
+                )
+
+        return llm_response
 
 
 # ============================================================

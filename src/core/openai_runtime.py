@@ -3,6 +3,8 @@ OpenAI SDK runtime — dùng cho:
 
   Blue Team → OpenRouter liquid/lfm-2.5-2.6b (create_blue_pair)
   Red Team  → OpenAI gpt-4o-mini (create_openai_pair) khi RED_TEAM_PROVIDER=openai
+              hoặc DeepSeek (OpenAI-compatible) khi RED_TEAM_PROVIDER=deepseek
+  Blue      → DeepSeek khi BLUE_PROVIDER_OVERRIDE=deepseek (tuỳ chọn, lệch rubric)
 
 Gemini Red Team dùng Google ADK trong agents/*.py — không đi qua file này.
 """

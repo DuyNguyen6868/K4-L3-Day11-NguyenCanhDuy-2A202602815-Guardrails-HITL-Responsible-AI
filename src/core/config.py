@@ -13,7 +13,12 @@ Hai tầng model (không trộn):
     → Model mềm (điểm bắt buộc CP4): ``gpt-4o-mini`` / ``gemini-3.5-flash``
     → Model khó (tuỳ chọn): ``gpt-5.6-luna`` / ``gemini-3.8-flash``
     → Bonus: chọn một — leak **Red** tối đa +5 **hoặc** leak **Red Advance** tối đa +10
-    → ``RED_TEAM_PROVIDER=openai|gemini`` (alias: ``LLM_PROVIDER``)
+    → ``RED_TEAM_PROVIDER=openai|gemini|deepseek`` (alias: ``LLM_PROVIDER``)
+
+  DeepSeek (tuỳ chọn, OpenAI-compatible — dùng khi không có key OpenAI/OpenRouter)
+    → Red: ``RED_TEAM_PROVIDER=deepseek`` + ``DEEPSEEK_API_KEY`` (+ ``DEEPSEEK_MODEL``)
+    → Blue: ``BLUE_PROVIDER_OVERRIDE=deepseek`` — lệch rubric (Blue chuẩn là
+      OpenRouter liquid), chỉ dùng khi không có OpenRouter key và đã báo coach.
 """
 from __future__ import annotations
 
@@ -33,6 +38,11 @@ except ImportError:
 PROVIDER_OPENAI = "openai"
 PROVIDER_GEMINI = "gemini"
 PROVIDER_OPENROUTER = "openrouter"
+PROVIDER_DEEPSEEK = "deepseek"
+
+# --- DeepSeek (OpenAI-compatible) ---
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-chat"
 
 # --- Blue Team (LOCKED) ---
 BLUE_PROVIDER = PROVIDER_OPENROUTER
@@ -99,12 +109,22 @@ except FileNotFoundError:
 # Blue Team — fixed OpenRouter Liquid
 # ---------------------------------------------------------------------------
 
+def blue_uses_deepseek_override() -> bool:
+    """True khi ``BLUE_PROVIDER_OVERRIDE=deepseek`` (tuỳ chọn, lệch rubric)."""
+    raw = os.environ.get("BLUE_PROVIDER_OVERRIDE", "").strip().lower()
+    return raw == PROVIDER_DEEPSEEK
+
+
 def get_blue_provider() -> str:
+    if blue_uses_deepseek_override():
+        return PROVIDER_DEEPSEEK
     return BLUE_PROVIDER
 
 
 def get_blue_model() -> str:
-    # Hard-locked; env cannot override for the graded Blue Team path.
+    # Locked to OpenRouter liquid unless the explicit DeepSeek override is set.
+    if blue_uses_deepseek_override():
+        return get_deepseek_model()
     return BLUE_MODEL
 
 
@@ -112,8 +132,32 @@ def get_openrouter_api_key() -> str:
     return os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
+def get_deepseek_api_key() -> str:
+    return os.environ.get("DEEPSEEK_API_KEY", "").strip()
+
+
+def get_deepseek_model() -> str:
+    return (
+        os.environ.get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL).strip()
+        or DEFAULT_DEEPSEEK_MODEL
+    )
+
+
+def deepseek_client_kwargs() -> dict:
+    """OpenAI SDK kwargs pointing at DeepSeek."""
+    return {
+        "api_key": get_deepseek_api_key() or None,
+        "base_url": (
+            os.environ.get("DEEPSEEK_BASE_URL", DEEPSEEK_BASE_URL).strip()
+            or DEEPSEEK_BASE_URL
+        ),
+    }
+
+
 def blue_client_kwargs() -> dict:
     """OpenAI SDK kwargs pointing at OpenRouter (Blue Team only)."""
+    if blue_uses_deepseek_override():
+        return deepseek_client_kwargs()
     return {
         "api_key": get_openrouter_api_key() or None,
         "base_url": (
@@ -128,7 +172,7 @@ def blue_provider_label() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Red Team — openai | gemini
+# Red Team — openai | gemini | deepseek
 # ---------------------------------------------------------------------------
 
 def get_red_provider() -> str:
@@ -139,6 +183,8 @@ def get_red_provider() -> str:
     ).strip().lower()
     if raw in {"gemini", "google", "adk"}:
         return PROVIDER_GEMINI
+    if raw == PROVIDER_DEEPSEEK:
+        return PROVIDER_DEEPSEEK
     return PROVIDER_OPENAI
 
 
@@ -149,6 +195,8 @@ def get_red_model() -> str:
             os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
             or DEFAULT_GEMINI_MODEL
         )
+    if get_red_provider() == PROVIDER_DEEPSEEK:
+        return get_deepseek_model()
     return (
         os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip()
         or DEFAULT_OPENAI_MODEL
@@ -170,7 +218,19 @@ def get_openai_api_key() -> str:
 
 
 def red_openai_client_kwargs() -> dict:
+    if get_red_provider() == PROVIDER_DEEPSEEK:
+        return deepseek_client_kwargs()
     return {"api_key": get_openai_api_key() or None}
+
+
+def get_red_api_key() -> str:
+    """Key của provider Red đang chọn (openai | gemini | deepseek)."""
+    red = get_red_provider()
+    if red == PROVIDER_GEMINI:
+        return os.environ.get("GOOGLE_API_KEY", "").strip()
+    if red == PROVIDER_DEEPSEEK:
+        return get_deepseek_api_key()
+    return get_openai_api_key()
 
 
 def red_provider_label(tier: str = "advance") -> str:
@@ -180,7 +240,8 @@ def red_provider_label(tier: str = "advance") -> str:
 
 
 def red_uses_openai_sdk() -> bool:
-    return get_red_provider() == PROVIDER_OPENAI
+    # DeepSeek is OpenAI-compatible → same OpenAIRunner path.
+    return get_red_provider() in {PROVIDER_OPENAI, PROVIDER_DEEPSEEK}
 
 
 def red_uses_gemini() -> bool:
@@ -235,12 +296,22 @@ def is_harder_model() -> bool:
 
 
 def setup_api_key():
-    """Ensure keys for Blue (OpenRouter) + Red / Red Advance (OpenAI or Gemini)."""
-    if not get_openrouter_api_key():
-        os.environ["OPENROUTER_API_KEY"] = input(
-            "Enter OpenRouter API Key (Blue): "
-        ).strip()
-    print(f"Blue  — {blue_provider_label()}  [LOCKED]")
+    """Ensure keys for Blue (OpenRouter | DeepSeek override) + Red / Red Advance."""
+    if blue_uses_deepseek_override():
+        if not get_deepseek_api_key():
+            os.environ["DEEPSEEK_API_KEY"] = input(
+                "Enter DeepSeek API Key (Blue override): "
+            ).strip()
+        print(
+            f"Blue  — {blue_provider_label()}  [OVERRIDE — rubric chuẩn là "
+            f"{BLUE_PROVIDER}:{BLUE_MODEL}]"
+        )
+    else:
+        if not get_openrouter_api_key():
+            os.environ["OPENROUTER_API_KEY"] = input(
+                "Enter OpenRouter API Key (Blue): "
+            ).strip()
+        print(f"Blue  — {blue_provider_label()}  [LOCKED]")
 
     red = get_red_provider()
     model = get_red_model()
@@ -249,6 +320,13 @@ def setup_api_key():
             os.environ["GOOGLE_API_KEY"] = input("Enter Google API Key (Red): ").strip()
         os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "0"
         print(f"Red / Red Advance  — gemini:{model}")
+    elif red == PROVIDER_DEEPSEEK:
+        if not get_deepseek_api_key():
+            os.environ["DEEPSEEK_API_KEY"] = input("Enter DeepSeek API Key (Red): ").strip()
+        print(
+            f"Red / Red Advance  — deepseek:{model}  "
+            f"(model mặc định rubric là {DEFAULT_OPENAI_MODEL} / {DEFAULT_GEMINI_MODEL})"
+        )
     else:
         if not get_openai_api_key():
             os.environ["OPENAI_API_KEY"] = input("Enter OpenAI API Key (Red): ").strip()
